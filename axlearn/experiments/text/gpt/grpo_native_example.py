@@ -28,7 +28,7 @@ from axlearn.common.module import Module
 from axlearn.common.state_builder import Builder, TensorStoreStateStorageBuilder
 from axlearn.experiments.text.common import tfds_text_source, vocab
 from axlearn.experiments.text.gpt import fuji
-from axlearn.experiments.text.gpt.common import MESH_AXIS_NAMES
+from axlearn.experiments.text.gpt.common import MESH_AXIS_NAMES, mesh_shape_from_axes
 from axlearn.experiments.text.gpt.vocabulary_fuji_v3 import FujiV3Vocabulary
 from axlearn.tools.convert_gsm8k_to_tfrecord import verify_and_print_records
 
@@ -237,9 +237,7 @@ def trainer_configs(
             eps=1e-8,
         )
 
-        logging.info(
-            "[eshenlog] Instantiating GrpoSpmdTrainer with custom 16-way FSDP sharding mesh..."
-        )
+        logging.info("[eshenlog] Instantiating GrpoSpmdTrainer with dynamic FSDP sharding mesh...")
         trainer_cfg = GrpoSpmdTrainer.default_config().set(
             name="grpo_trainer",  # Explicitly set name to satisfy config requirements
             model=grpo_model_cfg,
@@ -255,14 +253,9 @@ def trainer_configs(
                 optimizer=optimizer_cfg,  # <--- Satisfies required optimizer parameters!
             ),
             mesh_axis_names=MESH_AXIS_NAMES,  # Aligns natively with AXLearn's canonical 6D hybrid mesh constant!
-            mesh_shape=[
-                1,
-                1,
-                1,
-                16,
-                1,
-                1,
-            ],  # <--- Overrides to fsdp=16 sharding mesh to prevent OOM!
+            mesh_shape=mesh_shape_from_axes(
+                fsdp=-1
+            ),  # <--- Dynamically scale global mesh using AXLearn's native -1 inference!
         )
 
         # Dynamically load pre-trained foundation weights from GCS at startup based on model size
