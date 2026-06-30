@@ -180,6 +180,19 @@ class SpmdTrainer(Module):
         # See https://docs.jax.dev/en/latest/profiling.html#general-options
         python_tracer_level: Optional[int] = None
 
+        # Whether to use managed ML Diagnostics SDK for profiling.
+        use_mldiagnostics: bool = False
+        # The run name for ML Diagnostics.
+        mldiagnostics_run_name: Optional[str] = None
+        # The run group for ML Diagnostics.
+        mldiagnostics_run_group: Optional[str] = None
+        # The GCP project for ML Diagnostics.
+        mldiagnostics_project: Optional[str] = None
+        # The GCP region for ML Diagnostics.
+        mldiagnostics_region: Optional[str] = None
+        # The environment for ML Diagnostics.
+        mldiagnostics_environment: str = "prod"
+
         # Determines whether to run the XLA Silent-data-corruption Checker (XSC) for a given step.
         # If None, never run the checker.
         # N.B. if provided on backends other than TPU this will be a no-op with warning logs.
@@ -261,6 +274,9 @@ class SpmdTrainer(Module):
         self._device_monitor = maybe_instantiate(cfg.device_monitor)
         self._recorder = maybe_instantiate(cfg.recorder)
         self._is_initialized: bool = False
+        self._mldiagnostics_prof = None
+        self._mldiagnostics_run_name = None
+        self._use_mldiagnostics = cfg.use_mldiagnostics
         self._maybe_record_event(measurement.Event.START_ACCELERATOR_INIT)
 
         if cfg.model.dtype is None:
@@ -609,6 +625,9 @@ class SpmdTrainer(Module):
                 return None
 
             self._is_initialized = True
+
+            if self._use_mldiagnostics:
+                self._initialize_mldiagnostics()
 
             with self.checkpointer:
                 logging.info("Starting loop...")
@@ -1153,6 +1172,40 @@ class SpmdTrainer(Module):
             )
 
         self.summary_writer(self.step, {"loss": outputs["loss"], **outputs["summaries"]})
+
+        if self._use_mldiagnostics and jax.process_index() == 0:
+            try:
+                from google_cloud_mldiagnostics import metric_types, metrics
+
+                # Record Loss
+                loss_val = outputs["loss"]
+                if hasattr(loss_val, "item"):
+                    loss_val = loss_val.item()
+                metrics.record(metric_types.MetricType.LOSS, float(loss_val), step=self.step)
+
+                # Recursively search for learning rate in nested summaries
+                def find_lr(d: Any) -> Optional[Any]:
+                    if not isinstance(d, dict):
+                        return None
+                    if "learning_rate" in d:
+                        return d["learning_rate"]
+                    for v in d.values():
+                        res = find_lr(v)
+                        if res is not None:
+                            return res
+                    return None
+
+                lr_val = find_lr(outputs["summaries"])
+                if lr_val is not None:
+                    if hasattr(lr_val, "item"):
+                        lr_val = lr_val.item()
+                    metrics.record(
+                        metric_types.MetricType.LEARNING_RATE, float(lr_val), step=self.step
+                    )
+                if hasattr(metrics, "flush"):
+                    metrics.flush()
+            except Exception as e:  # pylint: disable=broad-exception-caught
+                logging.warning("Failed to log metrics to ML Diagnostics: %s", e)
         # Aggregate summaries across evalers.
         evaler_summaries = self._run_eval(
             train_summaries=outputs["summaries"], force_runs=force_run_evals
@@ -1335,6 +1388,106 @@ class SpmdTrainer(Module):
             aux=forward_outputs.aux,
         )
 
+    def _initialize_mldiagnostics(self):
+        # Workaround for Pathways JAX monkey-patch issue:
+        # In Pathways environments, jax.profiler.start_trace is monkey-patched to route the profile
+        # to the Pathways server. However, the monkey-patched version may not accept 'profiler_options'.
+        # We wrap it to gracefully strip out 'profiler_options' if a TypeError is encountered.
+        original_start_trace = jax.profiler.start_trace
+
+        def safe_start_trace(directory, **kwargs):
+            try:
+                return original_start_trace(directory, **kwargs)
+            except TypeError as e:
+                if "unexpected keyword argument 'profiler_options'" in str(e):
+                    logging.info(
+                        "Pathways start_trace monkey-patch detected. "
+                        "Retrying start_trace without 'profiler_options'."
+                    )
+                    kwargs.pop("profiler_options", None)
+                    return original_start_trace(directory, **kwargs)
+                raise e
+
+        jax.profiler.start_trace = safe_start_trace
+
+        cfg = self.config
+        try:
+            from google_cloud_mldiagnostics import machinelearning_run
+        except ImportError as e:
+            raise ImportError(
+                "google-cloud-mldiagnostics is not installed. Please install it or "
+                "set use_mldiagnostics=False."
+            ) from e
+
+        # Determine project ID if not configured.
+        project = cfg.mldiagnostics_project
+        if project is None:
+            try:
+                import google.auth
+
+                _, project = google.auth.default()
+            except Exception as e:
+                logging.warning("Failed to auto-detect GCP project for ML Diagnostics: %s", e)
+
+        # Determine run group.
+        run_group = cfg.mldiagnostics_run_group
+        if run_group is None:
+            run_group = os.environ.get("MLDIAGNOSTICS_RUN_GROUP")
+
+        # Determine run name.
+        run_name = cfg.mldiagnostics_run_name
+        if run_name is None:
+            run_name = os.environ.get("MLDIAGNOSTICS_RUN_NAME") or os.environ.get("NAME")
+        if run_name is None:
+            # Use the basename of the trainer directory as a default run name.
+            if cfg.dir:
+                run_name = os.path.basename(cfg.dir.rstrip("/"))
+            else:
+                run_name = "axlearn-run"
+        self._mldiagnostics_run_name = run_name
+
+        # Determine GCS path.
+        gcs_path = None
+        if cfg.dir and cfg.dir.startswith("gs://"):
+            gcs_path = cfg.dir
+
+        logging.info(
+            "Initializing ML Diagnostics SDK with name=%s, run_group=%s, project=%s, region=%s, gcs_path=%s",
+            run_name,
+            run_group,
+            project,
+            cfg.mldiagnostics_region,
+            gcs_path,
+        )
+
+        # If in Kubernetes/GKE but the GKE Diagon Operator webhook is not enabled/installed,
+        # temporarily clear KUBERNETES_SERVICE_HOST to force the SDK to run in standard VM mode,
+        # preventing the ValueError.
+        is_k8s = "KUBERNETES_SERVICE_HOST" in os.environ
+        has_diagon = "GKE_DIAGON_IDENTIFIER" in os.environ
+        k8s_host = None
+        if is_k8s and not has_diagon:
+            logging.info(
+                "GKE environment detected but GKE Diagon Operator is not enabled. "
+                "Temporarily running in non-GKE mode to bypass operator requirement."
+            )
+            k8s_host = os.environ.pop("KUBERNETES_SERVICE_HOST")
+
+        try:
+            machinelearning_run(
+                name=run_name,
+                run_group=run_group,
+                project=project,
+                region=cfg.mldiagnostics_region,
+                gcs_path=gcs_path,
+                on_demand_xprof=True,
+                environment=cfg.mldiagnostics_environment,
+            )
+        finally:
+            # Restore the environment variable if we popped it.
+            if k8s_host is not None:
+                os.environ["KUBERNETES_SERVICE_HOST"] = k8s_host
+
     def _maybe_stop_or_start_tracing(
         self, stop_trace_step: Optional[int], output: Optional[dict[str, Any]]
     ) -> Optional[int]:
@@ -1349,10 +1502,15 @@ class SpmdTrainer(Module):
         """
         updated_stop_trace_step = stop_trace_step
         # Check if we should stop tracing.
+        cfg = self.config
         if self.step == stop_trace_step:
             assert output is not None
             jax.tree.map(lambda x: x.block_until_ready(), output)
-            jax.profiler.stop_trace()
+            if cfg.use_mldiagnostics:
+                if self._mldiagnostics_prof is not None:
+                    self._mldiagnostics_prof.stop()
+            else:
+                jax.profiler.stop_trace()
             self._step_log("Stopped profiler tracing")
             updated_stop_trace_step = None
 
@@ -1374,18 +1532,38 @@ class SpmdTrainer(Module):
             )
         if should_start_tracing:
             self._step_log("Start profiler tracing")
-            profiler_options = jax.profiler.ProfileOptions()
-            if cfg.host_tracer_level is not None:
-                profiler_options.host_tracer_level = cfg.host_tracer_level
-            if cfg.device_tracer_level is not None:
-                profiler_options.device_tracer_level = cfg.device_tracer_level
-            if cfg.python_tracer_level is not None:
-                profiler_options.python_tracer_level = cfg.python_tracer_level
-            if cfg.tpu_trace_mode is not None:
-                profiler_options.advanced_configuration = {"tpu_trace_mode": cfg.tpu_trace_mode}
-            jax.profiler.start_trace(
-                self.summary_writer.config.dir, profiler_options=profiler_options
-            )
+            if cfg.use_mldiagnostics:
+                try:
+                    from google_cloud_mldiagnostics import xprof
+                except ImportError as e:
+                    raise ImportError(
+                        "google-cloud-mldiagnostics is not installed. Please install it or "
+                        "set use_mldiagnostics=False."
+                    ) from e
+                if self._mldiagnostics_prof is None:
+                    self._mldiagnostics_prof = xprof()
+                session_id = f"{self._mldiagnostics_run_name}_step_{self.step}"
+                self._mldiagnostics_prof.start(session_id=session_id)
+            else:
+                profiler_options = jax.profiler.ProfileOptions()
+                if cfg.host_tracer_level is not None:
+                    profiler_options.host_tracer_level = cfg.host_tracer_level
+                if cfg.device_tracer_level is not None:
+                    profiler_options.device_tracer_level = cfg.device_tracer_level
+                if cfg.python_tracer_level is not None:
+                    profiler_options.python_tracer_level = cfg.python_tracer_level
+                if cfg.tpu_trace_mode is not None:
+                    profiler_options.advanced_configuration = {"tpu_trace_mode": cfg.tpu_trace_mode}
+                try:
+                    jax.profiler.start_trace(
+                        self.summary_writer.config.dir, profiler_options=profiler_options
+                    )
+                except TypeError as e:
+                    logging.warning(
+                        "Failed to start trace with profiler_options, falling back to basic tracing: %s",
+                        e,
+                    )
+                    jax.profiler.start_trace(self.summary_writer.config.dir)
             updated_stop_trace_step = self.step + (
                 cfg.n_steps_for_each_trace if cfg.n_steps_for_each_trace is not None else 3
             )

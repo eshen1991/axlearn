@@ -80,6 +80,36 @@ flags.DEFINE_list(
     "Each trace covers one eval batch. "
     "Traces will run for at most 3 unique steps.",
 )
+flags.DEFINE_bool(
+    "use_mldiagnostics",
+    False,
+    "Whether to use managed ML Diagnostics SDK for profiling.",
+)
+flags.DEFINE_string(
+    "mldiagnostics_run_name",
+    None,
+    "The run name for ML Diagnostics.",
+)
+flags.DEFINE_string(
+    "mldiagnostics_run_group",
+    None,
+    "The run group for ML Diagnostics.",
+)
+flags.DEFINE_string(
+    "mldiagnostics_project",
+    None,
+    "The GCP project for ML Diagnostics. If None, auto-detects.",
+)
+flags.DEFINE_string(
+    "mldiagnostics_region",
+    None,
+    "The GCP region for ML Diagnostics. If None, auto-detects.",
+)
+flags.DEFINE_string(
+    "mldiagnostics_environment",
+    None,
+    "The environment for ML Diagnostics (e.g. 'production', 'autopush').",
+)
 flags.DEFINE_integer(
     "trainer_watchdog_timeout_seconds",
     3600,
@@ -186,6 +216,19 @@ def get_trainer_config(
         # Set trainer_dir if not already set.
         if not isinstance(trainer_config.checkpointer.trainer_dir, str):
             trainer_config.checkpointer.trainer_dir = trainer_config.dir
+
+    trainer_config.use_mldiagnostics = flag_values.use_mldiagnostics
+    if flag_values.mldiagnostics_run_name is not None:
+        trainer_config.mldiagnostics_run_name = flag_values.mldiagnostics_run_name
+    if flag_values.mldiagnostics_run_group is not None:
+        trainer_config.mldiagnostics_run_group = flag_values.mldiagnostics_run_group
+    if flag_values.mldiagnostics_project is not None:
+        trainer_config.mldiagnostics_project = flag_values.mldiagnostics_project
+    if flag_values.mldiagnostics_region is not None:
+        trainer_config.mldiagnostics_region = flag_values.mldiagnostics_region
+    if flag_values.mldiagnostics_environment is not None:
+        trainer_config.mldiagnostics_environment = flag_values.mldiagnostics_environment
+
     return trainer_config
 
 

@@ -471,6 +471,101 @@ class TrainerTest(test_utils.TestCase):
         # The prng_key per step is deterministic.
         np.testing.assert_array_equal(output_a["aux"]["prng_key"], output_b["aux"]["prng_key"])
 
+    def test_mldiagnostics(self):
+        from unittest import mock
+
+        cfg = SpmdTrainer.default_config().set(
+            name="test_trainer",
+            use_mldiagnostics=True,
+            start_trace_steps=(1, 5),
+            n_steps_for_each_trace=2,
+        )
+        cfg.dir = tempfile.mkdtemp()
+        cfg.mesh_axis_names = ("data", "model")
+        cfg.mesh_shape = (1, 1)
+        cfg.model = DummyModel.default_config().set(dtype=jnp.float32)
+        cfg.input = DummyInput.default_config()
+        cfg.learner = learner.Learner.default_config().set(
+            optimizer=config_for_function(optimizers.sgd_optimizer).set(
+                learning_rate=0.1,
+                decouple_weight_decay=True,
+                momentum=0.9,
+                weight_decay=1e-4,
+            )
+        )
+        cfg.max_step = 8
+        cfg.watchdog_timeout_seconds = 0.1
+        cfg.device_monitor = None
+        cfg.vlog = 2
+
+        mock_run = mock.MagicMock()
+        mock_xprof_instance = mock.MagicMock()
+        mock_xprof = mock.MagicMock(return_value=mock_xprof_instance)
+
+        mock_metrics = mock.MagicMock()
+        mock_metric_types = mock.MagicMock()
+
+        class MockMetricType:
+            LOSS = "LOSS"
+            LEARNING_RATE = "LEARNING_RATE"
+
+        mock_metric_types.MetricType = MockMetricType
+
+        mock_mld = mock.MagicMock(
+            machinelearning_run=mock_run,
+            xprof=mock_xprof,
+            metrics=mock_metrics,
+            metric_types=mock_metric_types,
+        )
+
+        modules = {
+            "google_cloud_mldiagnostics": mock_mld,
+            "google_cloud_mldiagnostics.metrics": mock_metrics,
+            "google_cloud_mldiagnostics.metric_types": mock_metric_types,
+        }
+        with mock.patch.dict("sys.modules", modules):
+            trainer: SpmdTrainer = cfg.instantiate(parent=None)
+            with mock.patch("google.auth.default", return_value=(None, "fake-project")):
+                trainer.run(prng_key=jax.random.PRNGKey(123))
+
+            # Assertions for the full run with local directory
+            mock_run.assert_called_once()
+            expected_name = os.path.basename(cfg.dir.rstrip("/"))
+            self.assertEqual(mock_run.call_args[1]["name"], expected_name)
+            self.assertEqual(mock_run.call_args[1]["project"], "fake-project")
+            self.assertEqual(mock_run.call_args[1]["environment"], "prod")
+            self.assertIsNone(mock_run.call_args[1]["gcs_path"])
+
+            self.assertEqual(mock_xprof_instance.start.call_count, 2)
+            self.assertEqual(mock_xprof_instance.stop.call_count, 2)
+            # Verify multi-host session_id grouping
+            mock_xprof_instance.start.assert_has_calls(
+                [
+                    mock.call(session_id=f"{expected_name}_step_1"),
+                    mock.call(session_id=f"{expected_name}_step_5"),
+                ]
+            )
+
+            # Verify model metrics logging to ML Diagnostics
+            mock_metrics.record.assert_any_call("LOSS", mock.ANY, step=1)
+            mock_metrics.record.assert_any_call("LEARNING_RATE", mock.ANY, step=1)
+
+            # Test GCS path detection by calling _initialize_mldiagnostics directly
+            trainer._config.dir = "gs://fake-bucket/my-gcs-run"
+            mock_run.reset_mock()
+            with mock.patch("google.auth.default", return_value=(None, "fake-project")):
+                trainer._initialize_mldiagnostics()
+
+            mock_run.assert_called_once_with(
+                name="my-gcs-run",
+                run_group=None,
+                project="fake-project",
+                region=None,
+                gcs_path="gs://fake-bucket/my-gcs-run",
+                on_demand_xprof=True,
+                environment="prod",
+            )
+
     @parameterized.product(
         [{"platform": "cpu", "mesh_shape": (1, 1)}, {"platform": "tpu", "mesh_shape": (4, 1)}],
         enable_python_cache=[True, False],

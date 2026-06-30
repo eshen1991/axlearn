@@ -59,6 +59,10 @@ _COLOCATED_CONTAINER_PORT = 50051
 # There is no guarantee that this image will work with newer Jax releases.
 # Note: This image has been tested with both Jax 0.8.2 and Jax 0.9.0
 _PATHWAYS_IMAGE_TAG = "20260128-jax_0.9.0"
+# _PATHWAYS_IMAGE_TAG = "20260624-jax_0.9.2"
+# _PATHWAYS_IMAGE_TAG = "20260408-jax_0.9.2"
+# _PATHWAYS_IMAGE_TAG = "20260624-jax_0.9.0"
+
 # The docker image used by pathways proxy container.
 _PATHWAYS_PROXY_IMAGE = (
     f"us-docker.pkg.dev/cloud-tpu-v2-images/pathways/proxy_server:{_PATHWAYS_IMAGE_TAG}"
@@ -316,6 +320,7 @@ def _build_base_pathways_worker_container(
         f"--gcs_scratch_location={base_container_builder.config.output_dir}/pathways-staging",
         # Recycling host memory gives a slight increase in performance.
         "--tpu_pinned_host_allocation_recycle=true",
+        # "--enforce_kernel_ipv6_support=false",
     ]
     if not colocated_python_plugin.is_colocated_python_enabled:
         args.append(
@@ -565,6 +570,7 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
             f"--resource_manager_address=localhost:{_PATHWAYS_RESOURCE_MANAGER_PORT}",
             f"--server_port={_PATHWAYS_PROXY_PORT}",
             f"--gcs_scratch_location={staging_location}",
+            # "--enforce_kernel_ipv6_support=false",
         ]
         if self._colocated_python.is_colocated_python_enabled:
             cmd_args.append("--sidecar_name=external")
@@ -615,6 +621,7 @@ class PathwaysReplicatedJob(BaseReplicatedJob):
                     f"--instance_count={pathways_instance_count}",
                     f"--instance_type={instance_type}",
                     f"--gcs_scratch_location={staging_location}",
+                    # "--enforce_kernel_ipv6_support=false",
                 ],
                 volumeMounts=[dict(name="shared-output", mountPath="/output")],
             ),
@@ -1200,6 +1207,7 @@ class PathwaysLeaderWorkerTemplate(BaseLeaderWorkerTemplate):
             f"--resource_manager_address=localhost:{_PATHWAYS_RESOURCE_MANAGER_PORT}",
             f"--server_port={_PATHWAYS_PROXY_PORT}",
             f"--gcs_scratch_location={staging_location}",
+            # "--enforce_kernel_ipv6_support=false",
         ]
         if self._colocated_python.is_colocated_python_enabled:
             cmd_args.append("--sidecar_name=external")
@@ -1238,6 +1246,7 @@ class PathwaysLeaderWorkerTemplate(BaseLeaderWorkerTemplate):
                 "--instance_count=1",
                 f"--instance_type={pathways_tpu_version}:{system.topology}",
                 f"--gcs_scratch_location={staging_location}",
+                # "--enforce_kernel_ipv6_support=false",
             ],
             ports=[dict(containerPort=_PATHWAYS_RESOURCE_MANAGER_PORT)],
         )

@@ -173,3 +173,11 @@ bazel-*
 
 # Emacs
 *~
+
+# eshen
+bin/
+eshen*
+pyvenv.cfg
+.gitignore
+data/
+.pre-commit-config.yaml

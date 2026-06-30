@@ -180,6 +180,7 @@ class GKEJob(GCPJob):
         cfg: GKEJob.Config = self.config
         annotations = maybe_instantiate(cfg.annotations or {})
         labels = maybe_instantiate(cfg.labels or {})
+        labels.setdefault("managed-mldiagnostics-gke", "true")
         if cfg.queue:
             annotations["kueue.x-k8s.io/queue-name"] = cfg.queue
 
@@ -529,6 +530,7 @@ class GKELeaderWorkerSet(GCPJob):
         cfg: GKELeaderWorkerSet.Config = self.config
         annotations = maybe_instantiate(cfg.annotations or {})
         labels = maybe_instantiate(cfg.labels or {})
+        labels.setdefault("managed-mldiagnostics-gke", "true")
 
         builder_labels = self._builder.get_workload_labels()
         if builder_labels:

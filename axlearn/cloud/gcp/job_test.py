@@ -141,9 +141,10 @@ class TPUGKEJobTest(TestCase):
         self.assertEqual(jobset_metadata["name"], cfg.name)
 
         # Test labels
+        self.assertEqual(jobset_labels.get("managed-mldiagnostics-gke"), "true")
         if labels is None:
-            # When labels is None, labels dict should be empty
-            self.assertEqual(jobset_labels, {})
+            # When labels is None, labels dict should only contain the default GKE ML Diagnostics label
+            self.assertEqual(jobset_labels, {"managed-mldiagnostics-gke": "true"})
         else:
             # When labels is provided, they should be present in metadata
             for key, value in labels.items():
@@ -258,9 +259,10 @@ class GPUGKEJobTest(TestCase):
             self.assertEqual(jobset_annotations["kueue.x-k8s.io/queue-name"], queue)
 
         # Test labels
+        self.assertEqual(jobset_labels.get("managed-mldiagnostics-gke"), "true")
         if labels is None:
-            # When labels is None, labels dict should be empty
-            self.assertEqual(jobset_labels, {})
+            # When labels is None, labels dict should only contain the default GKE ML Diagnostics label
+            self.assertEqual(jobset_labels, {"managed-mldiagnostics-gke": "true"})
         else:
             # When labels is provided, they should be present in metadata
             for key, value in labels.items():
@@ -498,9 +500,10 @@ class TPUGKELeaderWorkerSetTest(TestCase):
         self.assertEqual(lws_metadata["name"], cfg.name)
 
         # Test labels
+        self.assertEqual(lws_labels.get("managed-mldiagnostics-gke"), "true")
         if labels is None:
-            # When labels is None, labels dict should be empty
-            self.assertEqual(lws_labels, {})
+            # When labels is None, labels dict should only contain the default GKE ML Diagnostics label
+            self.assertEqual(lws_labels, {"managed-mldiagnostics-gke": "true"})
         else:
             # When labels is provided, they should be present in metadata
             for key, value in labels.items():
