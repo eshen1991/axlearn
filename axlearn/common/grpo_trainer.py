@@ -4,7 +4,7 @@
 
 import os
 import re
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import jax
 import jax.numpy as jnp
@@ -308,6 +308,41 @@ class GrpoSpmdTrainer(SpmdTrainer):
             )
 
         self.summary_writer(self.step, {"loss": outputs["loss"], **outputs["summaries"]})
+
+        if self._use_mldiagnostics and jax.process_index() == 0:
+            try:
+                from google_cloud_mldiagnostics import metric_types, metrics
+
+                # Record Loss
+                loss_val = outputs["loss"]
+                if hasattr(loss_val, "item"):
+                    loss_val = loss_val.item()
+                metrics.record(metric_types.MetricType.LOSS, float(loss_val), step=self.step)
+
+                # Recursively search for learning rate in nested summaries
+                def find_lr(d: Any) -> Optional[Any]:
+                    if not isinstance(d, dict):
+                        return None
+                    if "learning_rate" in d:
+                        return d["learning_rate"]
+                    for v in d.values():
+                        res = find_lr(v)
+                        if res is not None:
+                            return res
+                    return None
+
+                lr_val = find_lr(outputs["summaries"])
+                if lr_val is not None:
+                    if hasattr(lr_val, "item"):
+                        lr_val = lr_val.item()
+                    metrics.record(
+                        metric_types.MetricType.LEARNING_RATE, float(lr_val), step=self.step
+                    )
+                if hasattr(metrics, "flush"):
+                    metrics.flush()
+            except Exception as e:  # pylint: disable=broad-exception-caught
+                logging.warning("Failed to log metrics to ML Diagnostics: %s", e)
+
         evaler_summaries = self._run_eval(
             train_summaries=outputs["summaries"], force_runs=force_run_evals
         )
