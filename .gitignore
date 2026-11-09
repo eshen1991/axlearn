@@ -177,6 +177,7 @@ bazel-*
 # eshen
 bin/
 eshen*
+!axlearn/experiments/text/gpt/grpo_pathways/**
 pyvenv.cfg
 .gitignore
 data/

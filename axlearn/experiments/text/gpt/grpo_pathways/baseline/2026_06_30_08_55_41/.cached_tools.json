@@ -1,0 +1,21 @@
+{
+  "files": {
+    "server.-1.0000-eshen-v6e-rl-grpo-pathways-pwwk-0-0.xplane.pb": "N2wR4p2ER4mnkxdp/QCv0w==",
+    "server.-1.0000-eshen-v6e-rl-grpo-pathways-pwwk-0-1.xplane.pb": "Q83T8zl2JzO4ww6Xy63EnQ==",
+    "server.-1.0000-eshen-v6e-rl-grpo-pathways-pwwk-0-2.xplane.pb": "VgAf2r6sLOlBq37ilwXthQ==",
+    "server.-1.0000-eshen-v6e-rl-grpo-pathways-pwwk-0-3.xplane.pb": "rNG5dwI095BtNalqOL4r7A=="
+  },
+  "tools": [
+    "overview_page",
+    "trace_viewer@",
+    "graph_viewer",
+    "op_profile",
+    "input_pipeline_analyzer",
+    "memory_profile",
+    "memory_viewer",
+    "roofline_model",
+    "framework_op_stats",
+    "hlo_stats"
+  ],
+  "version": 1
+}
