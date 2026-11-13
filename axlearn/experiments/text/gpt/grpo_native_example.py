@@ -12,6 +12,7 @@ from absl import flags, logging
 from jax.sharding import PartitionSpec
 
 from axlearn.common import input_base, input_lm, input_tf_data, optimizers
+from axlearn.common.checkpointer import every_n_steps_policy
 from axlearn.common.config import (
     REQUIRED,
     InstantiableConfig,
@@ -34,6 +35,9 @@ from axlearn.experiments.text.gpt.common import MESH_AXIS_NAMES, mesh_shape_from
 from axlearn.experiments.text.gpt.vocabulary_fuji_v3 import FujiV3Vocabulary
 from axlearn.tools.convert_gsm8k_to_tfrecord import verify_and_print_records
 
+# Ensure Pathways head pod uses its auto-refreshing cloud-platform GCE metadata token even when
+# GOOGLE_AUTH_TOKEN_FOR_TESTING is passed via --env for read-only-scoped TPU worker pods (pwwk).
+os.environ.pop("GOOGLE_AUTH_TOKEN_FOR_TESTING", None)
 grpo_reward_type = os.getenv("GRPO_REWARD_TYPE", "dummy")
 
 
@@ -180,12 +184,12 @@ class GRPOStateBuilder(Builder):
         # Physically copy/clone the parameters PyTree using jax.tree.map(jnp.copy)
         # to create independent device buffers and prevent JAX double-donation crashes!
         cloned_reference_model = jax.tree.map(jnp.copy, flat_model)
-        cloned_sampler_model = jax.tree.map(jnp.copy, flat_model)
         actor_ref_model = {
             "actor": flat_model,
             "reference": cloned_reference_model,
-            "sampler": cloned_sampler_model,
         }
+        if "sampler" in state.trainer_state.model:
+            actor_ref_model["sampler"] = jax.tree.map(jnp.copy, flat_model)
 
         # 4. Rebuild the fully populated JAX TrainerState PyTree seamlessly
         updated_trainer_state = state.trainer_state._replace(model=actor_ref_model)
@@ -225,6 +229,13 @@ def trainer_configs(
         # This cuts the physical parameter and intermediate activations memory footprint in half globally!
         fuji_model_cfg.dtype = jnp.bfloat16
         fuji_model_cfg.decoder.dtype = jnp.bfloat16
+        # Full layer remat avoids caching 18 GiB/chip of [qkvo]_proj|context across 32 layers on 8-chip trainer_mesh.
+        if getattr(fuji_model_cfg.decoder.transformer, "layer", None) is not None and (
+            fuji_model_cfg.decoder.transformer.layer.remat_spec is not None
+        ):
+            fuji_model_cfg.decoder.transformer.layer.remat_spec.policy.names_which_can_be_saved = (
+                None
+            )
 
         # Overrides max_sequence_length to 512 to reduce the attention matrix footprint another 4-fold!
         # This guarantees high-speed, OOM-free training on standard word problem datasets like GSM8K.
@@ -277,6 +288,9 @@ def trainer_configs(
                 fsdp=-1
             ),  # <--- Dynamically scale global mesh using AXLearn's native -1 inference!
         )
+        trainer_cfg.checkpointer.save_policy = config_for_function(every_n_steps_policy).set(n=100)
+        trainer_cfg.checkpointer.keep_last_n = 2
+        trainer_cfg.summary_writer.write_every_n_steps = 10
 
         # Dynamically load pre-trained foundation weights from GCS at startup based on model size
         if model_size in ("8B", "70B"):

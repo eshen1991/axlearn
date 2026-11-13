@@ -4,24 +4,59 @@
 
 import os
 import re
-from typing import Any, Dict, Optional, Tuple
+import sys
+from collections import deque
+from typing import Any, Dict, Iterator, Optional, Tuple, Union
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 from absl import logging
-from jax.experimental.pjit import pjit
-from jax.sharding import PartitionSpec
+from jax.sharding import NamedSharding, PartitionSpec
 
 from axlearn.common import file_system as fs
-from axlearn.common import measurement, utils
+from axlearn.common import input_base, measurement, utils
+from axlearn.common.base_model import BaseModel
 from axlearn.common.config import REQUIRED, InstantiableConfig, Required, config_class
 from axlearn.common.module import Module, child_context
 from axlearn.common.module import functional as F
 from axlearn.common.module import new_output_collection
 from axlearn.common.trainer import SpmdTrainer, TrainerState
 from axlearn.common.update_transformation import ForwardOutputs
-from axlearn.common.utils import NestedTensor, Tensor, with_sharding_constraint
+from axlearn.common.utils import Nested, NestedTensor, Tensor, with_sharding_constraint
+
+
+class _PeekableIterator:
+    """Thin 1-item lookahead wrapper around an input iterator for N+1 rollout prefetching."""
+
+    def __init__(self, base_iter: Iterator[Any]):
+        self._base_iter = base_iter
+        self._buffer: deque[Any] = deque()
+        self._exhausted = False
+
+    @property
+    def raw_iterator(self) -> Iterator[Any]:
+        return self._base_iter
+
+    def peek(self) -> Optional[Any]:
+        """Returns the next batch without consuming it, or None if the iterator is exhausted."""
+        if not self._buffer and not self._exhausted:
+            try:
+                item = input_base.as_numpy_array(next(self._base_iter))
+                self._buffer.append(item)
+            except StopIteration:
+                self._exhausted = True
+        return self._buffer[0] if self._buffer else None
+
+    def __iter__(self) -> "_PeekableIterator":
+        return self
+
+    def __next__(self) -> Any:
+        if self._buffer:
+            return self._buffer.popleft()
+        if self._exhausted:
+            raise StopIteration
+        return input_base.as_numpy_array(next(self._base_iter))
 
 
 class GrpoSpmdTrainer(SpmdTrainer):
@@ -34,36 +69,160 @@ class GrpoSpmdTrainer(SpmdTrainer):
         num_generations: int = 4
         vocab: Required[InstantiableConfig] = REQUIRED  # SentencePiece vocabulary configuration!
         reward_type: str = "dummy"  # One of "gsm8k", "dummy", "exact_match"
+        # Intra-pod tensor-parallel degree for rollout_mesh (4 chips per v6e worker pod).
+        rollout_tp_degree: int = 4
+        # Enable N+1 asynchronous overlap between rollout_mesh and trainer_mesh.
+        enable_async_rollout: bool = True
 
-    def __init__(self, cfg: Config, *, parent: Module):
-        super().__init__(cfg, parent=parent)
+    def __init__(
+        self,
+        cfg: Config,
+        *,
+        parent: Optional[Module],
+        devices: Optional[np.ndarray] = None,
+    ):
+        # 1. Discover and sort global devices by slice/pod/coordinates BEFORE super().__init__
+        # so trainer_mesh (Actor + Reference + AdamW) and rollout_mesh (Sampler) bind to
+        # genuinely disjoint physical sub-slices.
+        raw_devices = list(jax.devices() if devices is None else np.asarray(devices).flatten())
+        sorted_devices = sorted(
+            raw_devices,
+            key=lambda d: (
+                getattr(d, "slice_index", 0),
+                getattr(d, "process_index", 0),
+                tuple(getattr(d, "coords", (d.id,))),
+                d.id,
+            ),
+        )
+        num_devices = len(sorted_devices)
+        if num_devices >= 2:
+            num_trainer_devices = num_devices // 2
+            trainer_devices = sorted_devices[:num_trainer_devices]
+            sampler_devices = sorted_devices[num_trainer_devices:]
+        else:
+            trainer_devices = sorted_devices
+            sampler_devices = sorted_devices
+
+        # Shape trainer mesh as FSDP-friendly 6D mesh: (pipeline, data, expert, fsdp, seq, model)
+        trainer_shape = (1, 1, 1, len(trainer_devices), 1, 1)
+        trainer_devices_arr = np.array(trainer_devices, dtype=object).reshape(trainer_shape)
+
+        # Shape rollout mesh with intra-pod TP (e.g. data=2, fsdp=1, model=4 on 8 chips).
+        tp_deg = cfg.rollout_tp_degree
+        if 1 < tp_deg <= len(sampler_devices) and len(sampler_devices) % tp_deg == 0:
+            sampler_data_deg = len(sampler_devices) // tp_deg
+            sampler_shape = (1, sampler_data_deg, 1, 1, 1, tp_deg)
+        else:
+            sampler_shape = (1, len(sampler_devices), 1, 1, 1, 1)
+        sampler_devices_arr = np.array(sampler_devices, dtype=object).reshape(sampler_shape)
+
+        # 2. Extract sampler config onto rollout_mesh so SpmdTrainer's single-mesh TrainerState,
+        # pjit init, and checkpointer only manage Actor + Reference on trainer_mesh.
+        cfg = cfg.clone()
+        sampler_cfg = (
+            cfg.model.sampler if cfg.model.sampler is not None else cfg.model.actor.clone()
+        )
+        if sampler_cfg.dtype is None:
+            sampler_cfg = sampler_cfg.clone(dtype=cfg.model.dtype)
+        cfg.model = cfg.model.clone(sampler=None)
+
+        super().__init__(cfg, parent=parent, devices=trainer_devices_arr)
+
         # Instantiate the configured vocabulary directly at startup!
         self._vocab = cfg.vocab.instantiate()
 
-        # Dynamically build dual meshes by splitting global devices 50/50
-        devices = self._mesh.devices.flatten()
-        num_devices = len(devices)
-        num_trainer_devices = int(num_devices * 0.5)
-        trainer_devices = devices[:num_trainer_devices]
-        sampler_devices = devices[num_trainer_devices:]
+        self.trainer_mesh = self._mesh
+        self.rollout_mesh = jax.sharding.Mesh(sampler_devices_arr, self._mesh.axis_names)
 
-        # Shape trainer mesh as FSDP-friendly 6D mesh shape
-        trainer_shape = [1, 1, 1, len(trainer_devices), 1, 1]
-        # Shape sampler mesh as Data-parallel-friendly 6D mesh shape
-        sampler_shape = [1, len(sampler_devices), 1, 1, 1, 1]
+        # Instantiate Sampler model and explicit NamedShardings on rollout_mesh.
+        with self.rollout_mesh:
+            self._sampler_model: BaseModel = self._add_child("sampler_model", sampler_cfg)
+            self._sampler_param_specs = self._sampler_model.create_parameter_specs_recursively()
+            self._sampler_param_shardings = jax.tree.map(
+                lambda spec: NamedSharding(
+                    self.rollout_mesh,
+                    PartitionSpec() if spec.mesh_axes is None else spec.mesh_axes,
+                    memory_kind=spec.memory_kind,
+                ),
+                self._sampler_param_specs,
+            )
 
-        self.trainer_mesh = jax.sharding.Mesh(
-            np.array(trainer_devices).reshape(trainer_shape), self._mesh.axis_names
+        self._sampler_params: Optional[NestedTensor] = None
+        self._prefetched_rollout: Optional[Tuple[Tensor, ...]] = None
+        self._rollout_prng_key: Optional[Tensor] = None
+
+        # Resolve Pathways direct TPU-to-TPU cross-mesh reshard helper on proxy backend.
+        # Note: On Pathways IFRT proxy, virtual TPU devices report jax.default_backend() == "tpu",
+        # while jax.config.jax_platforms / JAX_PLATFORMS contains "proxy".
+        self._pathways_reshard_fn = None
+        jax_platforms = getattr(jax.config, "jax_platforms", None) or os.environ.get(
+            "JAX_PLATFORMS", ""
         )
-        self.rollout_mesh = jax.sharding.Mesh(
-            np.array(sampler_devices).reshape(sampler_shape), self._mesh.axis_names
-        )
+        if jax.default_backend() == "proxy" or "proxy" in str(jax_platforms):
+            try:
+                from pathwaysutils.experimental import (
+                    reshard as pw_reshard,  # pylint: disable=import-outside-toplevel
+                )
+
+                self._pathways_reshard_fn = pw_reshard.reshard
+            except ImportError:
+                logging.warning(
+                    "pathwaysutils.experimental.reshard not found; falling back to jax.device_put."
+                )
 
         logging.info("GrpoSpmdTrainer initialized with disaggregated architecture:")
-        logging.info("  Global Mesh: %s", self._mesh)
-        logging.info("  Trainer Mesh: %s", self.trainer_mesh)
-        logging.info("  Rollout Mesh: %s", self.rollout_mesh)
-        logging.info("  Reward Type: %s", cfg.reward_type)
+        logging.info("  Total Global Devices: %d", num_devices)
+        logging.info("  Trainer Mesh (Actor + Ref): %s", self.trainer_mesh)
+        logging.info("  Rollout Mesh (Sampler):     %s", self.rollout_mesh)
+        logging.info(
+            "  Cross-Mesh Weight Sync:     %s",
+            "pathwaysutils.reshard" if self._pathways_reshard_fn else "jax.device_put",
+        )
+        logging.info("  Async N+1 Overlap:          %s", cfg.enable_async_rollout)
+        logging.info("  Reward Type:                %s", cfg.reward_type)
+
+    @property
+    def sampler_params(self) -> Optional[NestedTensor]:
+        """Returns the current Sampler parameters resident on `rollout_mesh`."""
+        return self._sampler_params
+
+    def _sync_actor_to_sampler(self, actor_params: NestedTensor) -> NestedTensor:
+        """Transfers updated Actor weights on `trainer_mesh` to Sampler on `rollout_mesh`."""
+        if self._pathways_reshard_fn is not None:
+            return self._pathways_reshard_fn(
+                actor_params,
+                self._sampler_param_shardings,
+                donate=False,
+                cache_resharding_plans=True,
+            )
+        return jax.tree.map(
+            jax.device_put,
+            actor_params,
+            self._sampler_param_shardings,
+        )
+
+    def _rollout_batch_partition_spec(self) -> PartitionSpec:
+        """Batch partition spec along active data-parallel axes of `rollout_mesh`."""
+        return PartitionSpec(("data", "expert", "fsdp"))
+
+    def _trainer_batch_partition_spec(self) -> PartitionSpec:
+        """Batch partition spec along active batch/FSDP axes of `trainer_mesh`."""
+        return PartitionSpec(("data", "expert", "fsdp"))
+
+    def _prepare_rollout_host_batch(self, raw_batch: Nested[Any]) -> Nested[np.ndarray]:
+        """Applies input dispatcher formatting to a peeked host batch before rollout placement."""
+        host_batch = input_base.as_numpy_array(raw_batch)
+        if "input_dispatcher" in self.input.children:
+            host_batch = self.input.input_dispatcher.logical_to_physical_batch(dict(host_batch))
+        return host_batch
+
+    def _host_to_rollout_array(self, host_batch: Nested[np.ndarray]) -> NestedTensor:
+        """Places a host NumPy batch onto `rollout_mesh`."""
+        with self.rollout_mesh:
+            return utils.host_to_global_array(
+                host_batch,
+                partition=self._rollout_batch_partition_spec(),
+            )
 
     def _score_gsm8k_rollouts_python(self, completions_np, targets_np) -> np.ndarray:
         def _parse_gsm8k_number(text: str) -> str:
@@ -121,11 +280,44 @@ class GrpoSpmdTrainer(SpmdTrainer):
 
         return np.array(rewards_list, dtype=np.float32)
 
+    def run(
+        self,
+        prng_key: Tensor,
+        return_evaler_summaries: Union[bool, set[str]] = False,
+    ) -> Optional[NestedTensor]:
+        """Runs the GRPO loop and ensures background MLDiagnostics servers do not hang exit."""
+        try:
+            output = super().run(prng_key, return_evaler_summaries=return_evaler_summaries)
+        except Exception:  # pylint: disable=broad-exception-caught
+            if self._use_mldiagnostics:
+                logging.exception(
+                    "Unhandled exception during GRPO run with MLDiagnostics enabled; "
+                    "stopping on-demand XProf server and exiting so JobSet can restart."
+                )
+                try:
+                    from google_cloud_mldiagnostics.core import xprof as mldiag_xprof
+
+                    mldiag_xprof.stop_on_demand_xprof()
+                except Exception:  # pylint: disable=broad-exception-caught
+                    pass
+                sys.stdout.flush()
+                sys.stderr.flush()
+                os._exit(1)
+            raise
+        if self._use_mldiagnostics:
+            try:
+                from google_cloud_mldiagnostics.core import xprof as mldiag_xprof
+
+                mldiag_xprof.stop_on_demand_xprof()
+            except Exception:  # pylint: disable=broad-exception-caught
+                pass
+        return output
+
     def _prepare_training(self, prng_key: Tensor) -> bool:
         self._maybe_record_event(measurement.Event.START_TRAINING_PREPARATION)
-        cfg = self.config
+        cfg: GrpoSpmdTrainer.Config = self.config
 
-        # Restore latest checkpoint
+        # Restore latest checkpoint on trainer_mesh
         self.restore_checkpoint(restore_step=None)
 
         if self.step is None:
@@ -150,39 +342,95 @@ class GrpoSpmdTrainer(SpmdTrainer):
             self._step_log("Already reached max_step=%s. Stopping", cfg.max_step)
             return False
 
-        # Compile rollout and update steps
-        self._jit_rollout_step = pjit(
-            self._rollout_step,
-            in_shardings=(
-                self._trainer_state_partition_specs.model,
-                None,
-                self._train_step_input_partition_specs(),
-            ),
-            out_shardings=(None, None, None, None),
+        # Synchronize initial Actor weights onto rollout_mesh for Sampler.
+        self._sampler_params = self._sync_actor_to_sampler(self._trainer_state.model["actor"])
+        self._rollout_prng_key = jax.device_put(
+            jax.random.fold_in(jax.device_get(self._trainer_state.prng_key), 99991),
+            NamedSharding(self.rollout_mesh, PartitionSpec()),
         )
 
-        self._jit_update_step = pjit(
+        # Build explicit NamedShardings so _jit_rollout_step compiles strictly onto rollout_mesh
+        # and _jit_update_step compiles strictly onto trainer_mesh.
+        rollout_scalar_sharding = NamedSharding(self.rollout_mesh, PartitionSpec())
+        rollout_seq_sharding = NamedSharding(
+            self.rollout_mesh, PartitionSpec(("data", "expert", "fsdp"), None)
+        )
+        rollout_vec_sharding = NamedSharding(
+            self.rollout_mesh, PartitionSpec(("data", "expert", "fsdp"))
+        )
+        rollout_input_sharding = NamedSharding(
+            self.rollout_mesh, self._rollout_batch_partition_spec()
+        )
+
+        self._jit_rollout_step = jax.jit(
+            self._rollout_step,
+            in_shardings=(
+                self._sampler_param_shardings,
+                rollout_scalar_sharding,
+                rollout_input_sharding,
+            ),
+            out_shardings=(
+                rollout_seq_sharding,
+                rollout_seq_sharding,
+                rollout_vec_sharding,
+                rollout_seq_sharding,
+                rollout_seq_sharding,
+            ),
+        )
+
+        trainer_scalar_sharding = NamedSharding(self.trainer_mesh, PartitionSpec())
+        trainer_seq_sharding = NamedSharding(
+            self.trainer_mesh, PartitionSpec(("data", "expert", "fsdp"), None)
+        )
+        trainer_vec_sharding = NamedSharding(
+            self.trainer_mesh, PartitionSpec(("data", "expert", "fsdp"))
+        )
+        trainer_input_sharding = jax.tree.map(
+            lambda spec: NamedSharding(
+                self.trainer_mesh, PartitionSpec() if spec is None else spec
+            ),
+            self._train_step_input_partition_specs(),
+        )
+
+        self._jit_update_step = jax.jit(
             self._update_step,
             in_shardings=(
                 self._trainer_state_partition_specs,
-                self._train_step_input_partition_specs(),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
+                trainer_input_sharding,
+                trainer_seq_sharding,
+                trainer_vec_sharding,
+                trainer_vec_sharding,
+                trainer_seq_sharding,
+                trainer_scalar_sharding,
+                trainer_scalar_sharding,
+                trainer_scalar_sharding,
             ),
             out_shardings=(
                 self._trainer_state_partition_specs,
                 dict(
-                    summaries=None,
-                    loss=None,
-                    aux=None,
+                    summaries=trainer_scalar_sharding,
+                    loss=trainer_scalar_sharding,
+                    aux=trainer_scalar_sharding,
                 ),
             ),
             donate_argnums=(0,),
         )
+
+        # Wrap input iterator for 1-step (N+1) lookahead and kick off Step 1 rollout asynchronously.
+        if not isinstance(self._input_iter, _PeekableIterator):
+            self._input_iter = _PeekableIterator(self._input_iter)
+
+        self._prefetched_rollout = None
+        if cfg.enable_async_rollout:
+            first_raw_batch = self._input_iter.peek()
+            if first_raw_batch is not None:
+                self._rollout_prng_key, rk = jax.random.split(self._rollout_prng_key)
+                first_rollout_batch = self._host_to_rollout_array(
+                    self._prepare_rollout_host_batch(first_raw_batch)
+                )
+                self._prefetched_rollout = self._jit_rollout_step(
+                    self._sampler_params, rk, first_rollout_batch
+                )
 
         self._maybe_record_event(measurement.Event.END_TRAINING_PREPARATION)
         return True
@@ -191,37 +439,49 @@ class GrpoSpmdTrainer(SpmdTrainer):
         self, input_batch: NestedTensor, *, force_run_evals: Optional[set[str]] = None
     ) -> NestedTensor:
         logging.log_first_n(logging.INFO, "global_input_batch=%s", 3, utils.shapes(input_batch))
+        cfg: GrpoSpmdTrainer.Config = self.config
 
         with jax.profiler.StepTraceAnnotation("train", step_num=self.step):
-            # 1. Split key on host CPU
-            keys = jax.random.split(self.trainer_state.prng_key, 5)
+            # 1. Split keys on trainer_mesh
+            keys = jax.random.split(self.trainer_state.prng_key, 4)
             new_prng_key = keys[0]
             param_noise_key = keys[1]
-            rollout_key = keys[2]
-            forward_key = keys[3]
-            learner_key = keys[4]
+            forward_key = keys[2]
+            learner_key = keys[3]
 
-            # 2. Execute Rollout on TPU
-            full_seqs, flat_completions, flat_prompt_len, clean_targets = self._jit_rollout_step(
-                self.trainer_state.model, rollout_key, input_batch
-            )
+            # 2. Consume in-flight rollout for Step N (or run synchronously if prefetch unavailable)
+            if self._prefetched_rollout is not None:
+                rollout_outputs = self._prefetched_rollout
+                self._prefetched_rollout = None
+            else:
+                self._rollout_prng_key, rk = jax.random.split(self._rollout_prng_key)
+                host_input = jax.device_get(input_batch)
+                rollout_batch = self._host_to_rollout_array(host_input)
+                rollout_outputs = self._jit_rollout_step(self._sampler_params, rk, rollout_batch)
 
-            # 3. Bring arrays to host CPU memory
-            flat_completions_np = np.asarray(flat_completions)
-            logging.info(
+            # 3. Single batched device-to-host fetch of compact rollout token/score arrays (~2 MB)
+            (
+                full_seqs_np,
+                flat_completions_np,
+                flat_prompt_len_np,
+                clean_targets_np,
+                sampler_seq_logps_np,
+            ) = jax.device_get(rollout_outputs)
+            logging.log_first_n(
+                logging.INFO,
                 "[eshenlog] Total number of generated answers in this batch: %d",
+                3,
                 flat_completions_np.shape[0],
             )
-            clean_targets_np = np.asarray(clean_targets)
 
-            # 4. Evaluate rewards in host Python
-            if self.config.reward_type == "gsm8k":
+            # 4. Evaluate rewards in host Python (~66 ms)
+            if cfg.reward_type == "gsm8k":
                 raw_rewards = self._score_gsm8k_rollouts_python(
                     flat_completions_np, clean_targets_np
                 )
-            elif self.config.reward_type == "dummy":
+            elif cfg.reward_type == "dummy":
                 raw_rewards = np.ones((flat_completions_np.shape[0],), dtype=np.float32)
-            elif self.config.reward_type == "exact_match":
+            elif cfg.reward_type == "exact_match":
                 len_diff = flat_completions_np.shape[1] - clean_targets_np.shape[1]
                 if len_diff > 0:
                     padded_clean_targets = np.pad(
@@ -246,53 +506,68 @@ class GrpoSpmdTrainer(SpmdTrainer):
                     np.float32
                 )
             else:
-                raise ValueError(f"Unsupported reward_type: {self.config.reward_type}")
+                raise ValueError(f"Unsupported reward_type: {cfg.reward_type}")
 
-            # 5. Calculate normalized advantages in host NumPy
-            num_generations = self.config.num_generations
+            # 5. Calculate group-normalized advantages in host NumPy
+            num_generations = cfg.num_generations
             batch_size = raw_rewards.shape[0] // num_generations
             grouped = raw_rewards.reshape(batch_size, num_generations)
             means = np.mean(grouped, axis=-1, keepdims=True)
             stds = np.std(grouped, axis=-1, ddof=1, keepdims=True)
             normalized = (grouped - means) / (stds + 1e-4)
-            advantages_np = normalized.flatten()
+            advantages_np = normalized.flatten().astype(np.float32)
 
-            # 6. Convert to JAX device array
-            advantages_jax = jnp.array(advantages_np)
+            # 6. Fix 4: Dispatch Step N+1 Rollout ASYNCHRONOUSLY onto rollout_mesh BEFORE blocking
+            # on Step N's policy update so rollout_mesh and trainer_mesh execute concurrently!
+            if (
+                cfg.enable_async_rollout
+                and self.step < cfg.max_step
+                and isinstance(self._input_iter, _PeekableIterator)
+            ):
+                next_raw_batch = self._input_iter.peek()
+                if next_raw_batch is not None:
+                    self._rollout_prng_key, next_rk = jax.random.split(self._rollout_prng_key)
+                    next_rollout_batch = self._host_to_rollout_array(
+                        self._prepare_rollout_host_batch(next_raw_batch)
+                    )
+                    self._prefetched_rollout = self._jit_rollout_step(
+                        self._sampler_params, next_rk, next_rollout_batch
+                    )
 
-            # 7. Execute JIT-compiled Update on TPU
+            # 7. Place Step N rollout sequences/advantages onto trainer_mesh and dispatch Update
+            with self.trainer_mesh:
+                full_seqs_trainer = utils.host_to_global_array(
+                    full_seqs_np, partition=PartitionSpec(("data", "expert", "fsdp"), None)
+                )
+                flat_prompt_len_trainer = utils.host_to_global_array(
+                    flat_prompt_len_np, partition=PartitionSpec(("data", "expert", "fsdp"))
+                )
+                advantages_trainer = utils.host_to_global_array(
+                    advantages_np, partition=PartitionSpec(("data", "expert", "fsdp"))
+                )
+                sampler_logps_trainer = utils.host_to_global_array(
+                    sampler_seq_logps_np, partition=PartitionSpec(("data", "expert", "fsdp"), None)
+                )
+
             self._trainer_state, outputs = self._jit_update_step(
                 self.trainer_state,
                 input_batch,
-                full_seqs,
-                flat_prompt_len,
-                advantages_jax,
+                full_seqs_trainer,
+                flat_prompt_len_trainer,
+                advantages_trainer,
+                sampler_logps_trainer,
                 param_noise_key,
                 forward_key,
                 learner_key,
             )
 
+            # 8. Fix 3: Direct TPU-to-TPU cross-mesh weight sync (trainer_mesh -> rollout_mesh)
+            self._sampler_params = self._sync_actor_to_sampler(self._trainer_state.model["actor"])
+
             # Append mean_reward to metrics
-            outputs["aux"]["mean_reward"] = jnp.mean(jnp.array(raw_rewards))
+            outputs["aux"]["mean_reward"] = jnp.asarray(np.mean(raw_rewards, dtype=np.float32))
 
-            # Log weight synchronization verification
-            n = self._config.log_every_n_steps or 100
-            should_log = (self.step % n == 0) or (0 <= self.step <= 5)
-            if should_log and "sampler" in self._trainer_state.model:
-                actor_params = self._trainer_state.model["actor"]
-                sampler_params = self._trainer_state.model["sampler"]
-                flat_actor, _ = jax.tree_util.tree_flatten(actor_params)
-                flat_sampler, _ = jax.tree_util.tree_flatten(sampler_params)
-                if flat_actor:
-                    actor_norm = np.asarray(jnp.sqrt(jnp.sum(jnp.square(flat_actor[0]))))
-                    sampler_norm = np.asarray(jnp.sqrt(jnp.sum(jnp.square(flat_sampler[0]))))
-                    logging.info(
-                        "[eshenlog] Disaggregated Weight Sync Verification | Actor Norm: %.6f | Sampler Norm: %.6f",
-                        actor_norm,
-                        sampler_norm,
-                    )
-
-            # Explicitly advance the state PRNG key
+            # Advance the state PRNG key on trainer_mesh
             self._trainer_state = TrainerState(
                 prng_key=new_prng_key,
                 model=self._trainer_state.model,
@@ -356,68 +631,79 @@ class GrpoSpmdTrainer(SpmdTrainer):
 
     def _rollout_step(
         self,
-        model_params: NestedTensor,
+        sampler_params: NestedTensor,
         rollout_key: Tensor,
         input_batch: dict,
-    ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
-        """Runs rollout generation on the rollout mesh."""
+    ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+        """Runs rollout generation strictly on `rollout_mesh`."""
 
         def train_cast(in_tree):
             per_param_train_dtype = self._per_param_train_dtype(in_tree)
             return utils.cast_floats_per_param(in_tree, per_param_train_dtype)
 
-        input_batch = train_cast(input_batch)
-        input_batch = self.input.dispatch_global_batch(input_batch)
-
-        params = train_cast(model_params)
-        actor_params = params["actor"]
-        sampler_params = params.get("sampler", actor_params)
-
-        input_ids = input_batch["input_ids"]
-        target_labels = input_batch["target_labels"]
-
-        model_pad_id = self.model.actor.decoder.config.pad_token_id
-
-        prompt_mask = (target_labels < 0) & (input_ids != 0)
-        clean_prefix = jnp.where(prompt_mask, input_ids, model_pad_id)
-
-        num_generations = self.config.num_generations
-        flat_prompt_len = jnp.repeat(jnp.sum(prompt_mask, axis=-1), num_generations, axis=0)
-
-        sampler_decoder = (
-            self.model.sampler.decoder
-            if hasattr(self.model, "sampler")
-            else self.model.actor.decoder
-        )
-
         with self.rollout_mesh:
+            input_batch = train_cast(input_batch)
+            input_batch = self.input.dispatch_global_batch(input_batch)
+            sampler_params = train_cast(sampler_params)
+
+            input_ids = input_batch["input_ids"]
+            target_labels = input_batch["target_labels"]
+
+            model_pad_id = self._sampler_model.decoder.config.pad_token_id
+
+            prompt_mask = (target_labels < 0) & (input_ids != 0)
+            clean_prefix = jnp.where(prompt_mask, input_ids, model_pad_id)
+
+            num_generations = self.config.num_generations
+            flat_prompt_len = jnp.repeat(jnp.sum(prompt_mask, axis=-1), num_generations, axis=0)
+
             sample_outputs, _ = F(
-                sampler_decoder,
+                self._sampler_model.decoder,
                 method="sample_decode",
                 state=sampler_params["decoder"],
                 prng_key=rollout_key,
                 is_training=False,
                 inputs=dict(
                     input_batch={"prefix": clean_prefix},
-                    max_sequence_length=512,
+                    max_sequence_length=input_ids.shape[-1],
                     num_decodes=num_generations,
                 ),
             )
 
-        generated_sequences = sample_outputs.sequences
-        batch_size, _, total_len = generated_sequences.shape
-        full_sequences = generated_sequences.reshape(-1, total_len)
+            raw_sequences = sample_outputs.sequences
+            _, _, total_len = raw_sequences.shape
+            flat_raw_sequences = raw_sequences.reshape(-1, total_len)
 
-        token_indices = jnp.arange(total_len)[None, :]
-        flat_completions = jnp.where(
-            token_indices >= (flat_prompt_len[:, None] + 1), full_sequences, 0
-        )
+            # Prepend the conditioning BOS token stripped by sample_decode so full_sequences and
+            # token_scores align identically with Actor/Reference forward passes.
+            bos_tokens = jnp.repeat(clean_prefix[:, :1], num_generations, axis=0)
+            full_sequences = jnp.concatenate([bos_tokens, flat_raw_sequences[:, :-1]], axis=-1)
 
-        flat_targets = jnp.repeat(input_batch["target_labels"], num_generations, axis=0)
-        pad_id = 0
-        clean_targets = jnp.where(flat_targets >= 0, flat_targets, pad_id)
+            if hasattr(sample_outputs, "token_scores") and sample_outputs.token_scores is not None:
+                sampler_seq_logps = sample_outputs.token_scores.reshape(-1, total_len)[:, :-1]
+            else:
+                # Sentinel NaN signals _update_step to fall back to stop_gradient(actor_seq_logps)
+                # for lightweight mock decoders in unit tests.
+                sampler_seq_logps = jnp.full(
+                    (full_sequences.shape[0], total_len - 1), jnp.nan, dtype=jnp.float32
+                )
 
-        return full_sequences, flat_completions, flat_prompt_len, clean_targets
+            token_indices = jnp.arange(total_len)[None, :]
+            flat_completions = jnp.where(
+                token_indices >= flat_prompt_len[:, None], full_sequences, 0
+            )
+
+            flat_targets = jnp.repeat(input_batch["target_labels"], num_generations, axis=0)
+            pad_id = 0
+            clean_targets = jnp.where(flat_targets >= 0, flat_targets, pad_id)
+
+            return (
+                full_sequences,
+                flat_completions,
+                flat_prompt_len,
+                clean_targets,
+                sampler_seq_logps,
+            )
 
     def _update_step(
         self,
@@ -426,33 +712,31 @@ class GrpoSpmdTrainer(SpmdTrainer):
         full_sequences: Tensor,
         flat_prompt_len: Tensor,
         advantages: Tensor,
+        sampler_seq_logps: Tensor,
         param_noise_key: Tensor,
         forward_key: Tensor,
         learner_key: Tensor,
     ) -> Tuple[TrainerState, Dict]:
-        """Applies forward pass and updates model parameters on the trainer mesh."""
+        """Applies forward pass and updates model parameters strictly on `trainer_mesh`."""
 
         def train_cast(in_tree):
             per_param_train_dtype = self._per_param_train_dtype(in_tree)
             return utils.cast_floats_per_param(in_tree, per_param_train_dtype)
 
-        input_batch = train_cast(input_batch)
-        input_batch = self.input.dispatch_global_batch(input_batch)
+        with self.trainer_mesh:
+            input_batch = train_cast(input_batch)
+            input_batch = self.input.dispatch_global_batch(input_batch)
 
-        def _forward(*, inputs: NestedTensor, model_params: NestedTensor) -> ForwardOutputs:
-            params = train_cast(model_params)
-            actor_params = params["actor"]
-            ref_params = params["reference"]
+            def _forward(*, inputs: NestedTensor, model_params: NestedTensor) -> ForwardOutputs:
+                params = train_cast(model_params)
+                actor_params = params["actor"]
+                ref_params = params["reference"]
 
-            with self.trainer_mesh:
+                batch_spec = PartitionSpec(("data", "expert", "fsdp"), None)
                 eval_input = {
-                    "input_ids": with_sharding_constraint(
-                        inputs["full_sequences"], PartitionSpec("fsdp", None)
-                    ),
+                    "input_ids": with_sharding_constraint(inputs["full_sequences"], batch_spec),
                     "positions": jnp.arange(inputs["full_sequences"].shape[1])[None, :],
-                    "target_labels": with_sharding_constraint(
-                        inputs["full_sequences"], PartitionSpec("fsdp", None)
-                    ),
+                    "target_labels": with_sharding_constraint(inputs["full_sequences"], batch_spec),
                 }
 
                 model_output_collection = new_output_collection()
@@ -498,7 +782,14 @@ class GrpoSpmdTrainer(SpmdTrainer):
                     inputs["full_sequences"][:, 1:] != pad_id
                 )
 
-                old_seq_logps = jax.lax.stop_gradient(actor_seq_logps)
+                raw_old_logps = jax.lax.stop_gradient(inputs["sampler_seq_logps"]).astype(
+                    actor_seq_logps.dtype
+                )
+                old_seq_logps = jnp.where(
+                    jnp.isnan(raw_old_logps),
+                    jax.lax.stop_gradient(actor_seq_logps),
+                    raw_old_logps,
+                )
 
                 learner_outputs = self.learner.grpo_loss(
                     actor_logps=actor_seq_logps,
@@ -511,61 +802,49 @@ class GrpoSpmdTrainer(SpmdTrainer):
                 loss, loss_metrics = learner_outputs
                 loss_metrics["std_advantage"] = jnp.std(inputs["advantages"])
 
-            return ForwardOutputs(
-                loss=loss, aux=loss_metrics, output_collection=model_output_collection
-            )
+                return ForwardOutputs(
+                    loss=loss, aux=loss_metrics, output_collection=model_output_collection
+                )
 
-        opt_params = self._opt_params(state.model)
+            opt_params = self._opt_params(state.model)
 
-        fwd_bwd_outputs, learner_output_collection = F(
-            self.learner,
-            method="forward_and_backward",
-            state=state.learner,
-            is_training=True,
-            prng_key=learner_key,
-            inputs=dict(
-                fn=_forward,
-                opt_params=opt_params,
+            fwd_bwd_outputs, learner_output_collection = F(
+                self.learner,
+                method="forward_and_backward",
+                state=state.learner,
+                is_training=True,
+                prng_key=learner_key,
                 inputs=dict(
-                    input_batch=input_batch,
-                    full_sequences=full_sequences,
-                    flat_prompt_len=flat_prompt_len,
-                    advantages=advantages,
-                    forward_key=forward_key,
-                    param_noise_key=param_noise_key,
+                    fn=_forward,
+                    opt_params=opt_params,
+                    inputs=dict(
+                        input_batch=input_batch,
+                        full_sequences=full_sequences,
+                        flat_prompt_len=flat_prompt_len,
+                        advantages=advantages,
+                        sampler_seq_logps=sampler_seq_logps,
+                        forward_key=forward_key,
+                        param_noise_key=param_noise_key,
+                    ),
                 ),
-            ),
-        )
-
-        forward_outputs: ForwardOutputs = fwd_bwd_outputs.forward_outputs
-        updated_model_params = fwd_bwd_outputs.backward_outputs.updated_params
-
-        # Disaggregated Weight Sync: Reshard updated actor weights to the sampler parameters on rollout_mesh
-        if "sampler" in updated_model_params:
-            sampler_sharding = self.trainer_state_partition_specs.model["sampler"]
-            synchronized_sampler_params = jax.tree.map(
-                lambda actor_param, sharding: jax.device_put(actor_param, sharding),
-                updated_model_params["actor"],
-                sampler_sharding,
             )
-            updated_model_params = {
-                **updated_model_params,
-                "sampler": synchronized_sampler_params,
-            }
 
-        updated_state = TrainerState(
-            prng_key=state.prng_key,
-            model=updated_model_params,
-            learner=learner_output_collection.state_updates,
-        )
+            forward_outputs: ForwardOutputs = fwd_bwd_outputs.forward_outputs
+            updated_model_params = fwd_bwd_outputs.backward_outputs.updated_params
 
-        summaries = dict(
-            model=forward_outputs.output_collection.summaries,
-            learner=learner_output_collection.summaries,
-        )
+            updated_state = TrainerState(
+                prng_key=state.prng_key,
+                model=updated_model_params,
+                learner=learner_output_collection.state_updates,
+            )
 
-        return updated_state, dict(
-            summaries=summaries,
-            loss=forward_outputs.loss,
-            aux=forward_outputs.aux,
-        )
+            summaries = dict(
+                model=forward_outputs.output_collection.summaries,
+                learner=learner_output_collection.summaries,
+            )
+
+            return updated_state, dict(
+                summaries=summaries,
+                loss=forward_outputs.loss,
+                aux=forward_outputs.aux,
+            )

@@ -26,6 +26,8 @@ class DummyVocab:
         return self
 
     def decode(self, ids):
+        if ids and ids[0] == 2:
+            return "mock_decoded_text #### 99"
         return "mock_decoded_text #### 42"
 
 
@@ -35,12 +37,16 @@ class MockGRPOInput(Input):
         pass
 
     def dataset(self):
-        # Yield dict matching GRPO trainer batch requirements
-        batch = {
-            "input_ids": jnp.ones([8, 32], dtype=jnp.int32),
-            "target_labels": -jnp.ones([8, 32], dtype=jnp.int32),  # mask out prefix
-        }
-        yield batch
+        # Yield multiple batches with 8 prompt tokens (<0) + 24 target tokens (>0)
+        target_labels = jnp.concatenate(
+            [-jnp.ones([8, 8], dtype=jnp.int32), jnp.ones([8, 24], dtype=jnp.int32)], axis=-1
+        )
+        for _ in range(8):
+            batch = {
+                "input_ids": jnp.ones([8, 32], dtype=jnp.int32),
+                "target_labels": target_labels,
+            }
+            yield batch
 
 
 class SimpleDecoder(BaseModel):
@@ -61,9 +67,15 @@ class SimpleDecoder(BaseModel):
         return {"weight": jax.random.normal(prng_key, [8, 8], dtype=jnp.float32)}
 
     def sample_decode(self, input_batch, max_sequence_length, num_decodes):
+        batch_size = input_batch["prefix"].shape[0]
+        # Give sibling generations contrasting tokens (1 vs 2) so group advantages are non-zero!
+        gen_tokens = jnp.arange(1, num_decodes + 1, dtype=jnp.int32)[None, :, None]
+        seqs = jnp.broadcast_to(gen_tokens, [batch_size, num_decodes, max_sequence_length])
+
         class Outputs:
-            sequences = jnp.ones(
-                [input_batch["prefix"].shape[0], num_decodes, max_sequence_length], dtype=jnp.int32
+            sequences = seqs
+            token_scores = -jnp.ones(
+                [batch_size, num_decodes, max_sequence_length], dtype=jnp.float32
             )
 
         return Outputs()
@@ -104,11 +116,26 @@ class GrpoTrainerTest(test_utils.TestCase):
     """Tests GrpoSpmdTrainer disaggregated execution."""
 
     @parameterized.parameters(
-        {"platform": "cpu", "mesh_shape": (1, 1, 1, 8, 1, 1), "reward_type": "gsm8k"},
-        {"platform": "cpu", "mesh_shape": (1, 1, 1, 8, 1, 1), "reward_type": "dummy"},
-        {"platform": "cpu", "mesh_shape": (1, 1, 1, 8, 1, 1), "reward_type": "exact_match"},
+        {
+            "platform": "cpu",
+            "mesh_shape": (1, 1, 1, 8, 1, 1),
+            "reward_type": "gsm8k",
+            "max_step": 3,
+        },
+        {
+            "platform": "cpu",
+            "mesh_shape": (1, 1, 1, 8, 1, 1),
+            "reward_type": "dummy",
+            "max_step": 1,
+        },
+        {
+            "platform": "cpu",
+            "mesh_shape": (1, 1, 1, 8, 1, 1),
+            "reward_type": "exact_match",
+            "max_step": 2,
+        },
     )
-    def test_disaggregated_trainer(self, platform, mesh_shape, reward_type):
+    def test_disaggregated_trainer(self, platform, mesh_shape, reward_type, max_step):
         if not test_utils.is_supported_platform(platform):
             return
 
@@ -128,13 +155,13 @@ class GrpoTrainerTest(test_utils.TestCase):
             ),
             vocab=config_for_function(DummyVocab),
             num_generations=2,
-            max_step=1,
+            max_step=max_step,
             learner=AxlearnGrpoLearner.default_config().set(
                 name="learner",
                 num_generations=2,
                 beta=0.04,
                 optimizer=config_for_function(optimizers.sgd_optimizer).set(
-                    learning_rate=0.1, decouple_weight_decay=True
+                    learning_rate=0.1, decouple_weight_decay=True, weight_decay=0.01
                 ),
                 update_rules=[
                     ("reference/.*", UpdateType.NO_UPDATE),
@@ -147,25 +174,32 @@ class GrpoTrainerTest(test_utils.TestCase):
         # 2. Instantiate Trainer
         trainer: GrpoSpmdTrainer = cfg.instantiate(parent=None)
 
-        # Verify dual meshes constructed successfully
+        # Verify dual meshes constructed on strictly disjoint physical device sets
         self.assertEqual(trainer.trainer_mesh.devices.size, 4)
         self.assertEqual(trainer.rollout_mesh.devices.size, 4)
+        self.assertTrue(
+            set(trainer.trainer_mesh.devices.flatten()).isdisjoint(
+                set(trainer.rollout_mesh.devices.flatten())
+            )
+        )
+        # Verify opposite shardings: FSDP on trainer_mesh vs TP (model=4, fsdp=1) on rollout_mesh
+        self.assertEqual(trainer.trainer_mesh.shape["fsdp"], 4)
+        self.assertEqual(trainer.trainer_mesh.shape["model"], 1)
+        self.assertEqual(trainer.rollout_mesh.shape["fsdp"], 1)
+        self.assertEqual(trainer.rollout_mesh.shape["model"], 4)
 
-        # Verify sharding of parameters across the global mesh
+        # Verify Actor & Reference bind to trainer_mesh while Sampler is decoupled onto rollout_mesh
         self.assertEqual(
             trainer.trainer_state_partition_specs.model["actor"]["decoder"]["weight"].mesh,
-            trainer.mesh(),
+            trainer.trainer_mesh,
         )
         self.assertEqual(
             trainer.trainer_state_partition_specs.model["reference"]["decoder"]["weight"].mesh,
-            trainer.mesh(),
+            trainer.trainer_mesh,
         )
-        self.assertEqual(
-            trainer.trainer_state_partition_specs.model["sampler"]["decoder"]["weight"].mesh,
-            trainer.mesh(),
-        )
+        self.assertNotIn("sampler", trainer.trainer_state_partition_specs.model)
 
-        # 3. Initialize state
+        # 3. Initialize state on trainer_mesh
         prng_key = jax.random.PRNGKey(123)
         with trainer.mesh():
             trainer.init(prng_key)
@@ -173,30 +207,35 @@ class GrpoTrainerTest(test_utils.TestCase):
         state = trainer.trainer_state
 
         # Capture initial parameters
-        initial_actor_weight = state.model["actor"]["decoder"]["weight"]
-        initial_ref_weight = state.model["reference"]["decoder"]["weight"]
-        initial_sampler_weight = state.model["sampler"]["decoder"]["weight"]
+        initial_actor_weight = np.asarray(state.model["actor"]["decoder"]["weight"]).copy()
+        initial_ref_weight = np.asarray(state.model["reference"]["decoder"]["weight"]).copy()
 
-        # 4. Execute one training step
+        # 4. Execute training steps (including N+1 async rollout/update overlap)
         output = trainer.run(prng_key=prng_key)
+        self.assertIsNotNone(output)
+        self.assertEqual(trainer.step, max_step)
         final_state = trainer.trainer_state
 
         final_actor_weight = final_state.model["actor"]["decoder"]["weight"]
         final_ref_weight = final_state.model["reference"]["decoder"]["weight"]
-        final_sampler_weight = final_state.model["sampler"]["decoder"]["weight"]
+        final_sampler_weight = trainer.sampler_params["decoder"]["weight"]
 
         # 5. Validate results
-        # Actor should have updated weights due to SFT training
-        self.assertFalse(np.array_equal(initial_actor_weight, final_actor_weight))
+        # Actor should have updated weights on trainer_mesh
+        self.assertFalse(np.array_equal(initial_actor_weight, np.asarray(final_actor_weight)))
+        self.assertEqual(final_actor_weight.sharding.mesh, trainer.trainer_mesh)
 
-        # Reference weights must be COMPLETELY unchanged
-        self.assertTrue(np.array_equal(initial_ref_weight, final_ref_weight))
+        # Reference weights must be COMPLETELY unchanged on trainer_mesh
+        self.assertTrue(np.array_equal(initial_ref_weight, np.asarray(final_ref_weight)))
+        self.assertEqual(final_ref_weight.sharding.mesh, trainer.trainer_mesh)
 
-        # Sampler weights must exactly match final actor weights (successful synchronization!)
-        self.assertTrue(np.array_equal(final_sampler_weight, final_actor_weight))
-        self.assertEqual(final_sampler_weight.sharding.mesh, trainer.mesh())
+        # Sampler weights must match final actor weights AND reside on rollout_mesh!
+        self.assertTrue(
+            np.allclose(np.asarray(final_sampler_weight), np.asarray(final_actor_weight))
+        )
+        self.assertEqual(final_sampler_weight.sharding.mesh, trainer.rollout_mesh)
 
-        # Verify optimizer state is only allocated for actor (reference and sampler have none)
+        # Verify optimizer state is only allocated for actor (reference has none)
         optimizer_state = final_state.learner["optimizer"]
         import optax
 
