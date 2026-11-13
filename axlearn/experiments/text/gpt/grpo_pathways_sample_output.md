@@ -6,7 +6,7 @@ export RUNNER_NAME=gke_tpu_single
 export CONFIG=grpo-fuji-8B-v1
 export INSTANCE_TYPE=tpu-v6e-16
 export CLUSTER=ericshen-axlearn
-export OUTPUT_DIR="gs://cloud-tpu-multipod-dev-axlearn/users/ericshen/${NAME}/$(date +%s)"
+export OUTPUT_DIR="gs://<gcs-bucket>/users/ericshen/${NAME}/$(date +%s)"
 
 ➜  ~ nohup axlearn gcp launch run \
   --cluster=$CLUSTER \
@@ -24,15 +24,15 @@ export OUTPUT_DIR="gs://cloud-tpu-multipod-dev-axlearn/users/ericshen/${NAME}/$(
   --module=text.gpt.grpo_native_example \
   --config=$CONFIG \
   --trainer_dir=$OUTPUT_DIR \
-  --data_dir=gs://ericshen-axlearn/tensorflow-datasets \
+  --data_dir=gs://<gcs-bucket>/tensorflow-datasets \
   --jax_backend=proxy \
    --trainer_log_every_n_steps=10 > axlearn_launcher.log 2>&1 &
 
 ```
-## output directory gs://cloud-tpu-multipod-dev-axlearn/users/ericshen/eshen-v6e-rl-grpo-pathways/1779314896
+## output directory gs://<gcs-bucket>/users/ericshen/eshen-v6e-rl-grpo-pathways/1779314896
 ## trainer_config
 ```shell
-➜  ~ gcloud storage cat gs://cloud-tpu-multipod-dev-axlearn/users/ericshen/eshen-v6e-rl-grpo-pathways/1779314896/trainer_config
+➜  ~ gcloud storage cat gs://<gcs-bucket>/users/ericshen/eshen-v6e-rl-grpo-pathways/1779314896/trainer_config
 batch_axis_names: 'data'
 checkpointer.gc_loop_interval_seconds: 60
 checkpointer.keep_last_n: 1
@@ -43,10 +43,10 @@ checkpointer.save_policy.n: 1
 checkpointer.storage.klass: 'axlearn.common.checkpointer.TensorStoreStateStorage'
 checkpointer.storage.timeout_secs: 3600
 crash_on_hang_timeout_seconds: 7200
-dir: 'gs://cloud-tpu-multipod-dev-axlearn/users/ericshen/eshen-v6e-rl-grpo-pathways/1779314896'
+dir: 'gs://<gcs-bucket>/users/ericshen/eshen-v6e-rl-grpo-pathways/1779314896'
 init_state_builder.klass: 'axlearn.experiments.text.gpt.grpo_native_example.GRPOStateBuilder'
 init_state_builder.storage_builder.concurrent_gb: 4
-init_state_builder.storage_builder.dir: 'gs://ericshen-axlearn/checkpoints/llama-3-1-8B-instruct/step_00000000'
+init_state_builder.storage_builder.dir: 'gs://<gcs-bucket>/checkpoints/llama-3-1-8B-instruct/step_00000000'
 init_state_builder.storage_builder.klass: 'axlearn.common.state_builder.TensorStoreStateStorageBuilder'
 init_state_builder.storage_builder.storage.klass: 'axlearn.common.checkpointer.TensorStoreStateStorage'
 init_state_builder.storage_builder.storage.timeout_secs: 3600
@@ -512,7 +512,7 @@ watchdog_timeout_seconds: 3600%
 ```
 ## model_analysis
 ```shell
-➜  ~ gcloud storage cat gs://cloud-tpu-multipod-dev-axlearn/users/ericshen/eshen-v6e-rl-grpo-pathways/1779314896/model_analysis.txt | tr '\t' '\n'
+➜  ~ gcloud storage cat gs://<gcs-bucket>/users/ericshen/eshen-v6e-rl-grpo-pathways/1779314896/model_analysis.txt | tr '\t' '\n'
 ##################### Model analysis #####################
 ## Parameters:
  525336576 [128256, 4096]       actor/decoder/emb/token_emb/weight
